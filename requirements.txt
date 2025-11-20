@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pandas
+numpy
+requests
+matplotlib
+duckdb
+urllib3
+pydantic
