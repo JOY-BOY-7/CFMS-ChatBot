@@ -1,7 +1,7 @@
 import uuid
 import time
 
-# In-memory store: { session_id: { "df": dataframe, "schema": json, "aliases": str, "timestamp": time } }
+# In-memory store
 SESSION_STORE = {}
 
 def create_session(processed_bundle):
@@ -10,19 +10,33 @@ def create_session(processed_bundle):
         "df": processed_bundle["df"],
         "schema_json": processed_bundle["schema_json"],
         "aliases": processed_bundle["aliases"],
-        "last_accessed": time.time()
+        "last_accessed": time.time() # timestamp
     }
     return session_id
 
 def get_session(session_id):
     if session_id in SESSION_STORE:
+        # Update timestamp whenever user asks a question (keep session alive)
         SESSION_STORE[session_id]["last_accessed"] = time.time()
         return SESSION_STORE[session_id]
     return None
 
 def cleanup_sessions(timeout_seconds=3600):
-    """Removes old sessions to free memory"""
+    """
+    Removes sessions inactive for > timeout_seconds.
+    Default: 3600 seconds (1 Hour).
+    """
     now = time.time()
-    to_remove = [k for k, v in SESSION_STORE.items() if now - v["last_accessed"] > timeout_seconds]
-    for k in to_remove:
-        del SESSION_STORE[k]
+    # Create a list of keys to delete (cannot delete while iterating)
+    expired_ids = [
+        sid for sid, data in SESSION_STORE.items() 
+        if (now - data["last_accessed"]) > timeout_seconds
+    ]
+    
+    count = 0
+    for sid in expired_ids:
+        del SESSION_STORE[sid]
+        count += 1
+        
+    if count > 0:
+        print(f"🧹 CLEANUP: Removed {count} expired sessions.")
