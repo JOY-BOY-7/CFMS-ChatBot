@@ -1,22 +1,53 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Request, Cookie
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import io
 import uvicorn
 import json
+import threading  # <--- NEW
+import time       # <--- NEW
 from typing import Optional, List, Dict, Any
 
 # Import local modules
 from src.data_loader import fetch_odata_cached
 from src.data_processor import build_processed_bundle_from_df
-from src.data_manager import create_session, get_session
+from src.data_manager import create_session, get_session, cleanup_sessions # <--- Added cleanup_sessions
 from src.llm_engine import call_gemini_json, build_prompt_cached
 from src.execution import safe_exec
 from src.utils import extract_json_from_response
 
 app = FastAPI(title="SAP OData ChatBot API")
 
-# --- Pydantic Models ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows ALL domains (Use specific domains in production)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+# --- BACKGROUND TASK: CLEANUP LOOP ---
+def run_cleanup_scheduler():
+    """
+    Runs in the background. Checks every 10 minutes (600s).
+    Deletes sessions older than 1 hour (3600s).
+    """
+    while True:
+        time.sleep(600)  # Wait 10 minutes
+        try:
+            cleanup_sessions(timeout_seconds=3600)
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    # Start the background thread as a Daemon (dies when main app dies)
+    t = threading.Thread(target=run_cleanup_scheduler, daemon=True)
+    t.start()
+    print("🕒 Session Cleanup Scheduler Started (TTL: 1 Hour)")
+
+# --- Pydantic Models & Helpers (Same as before) ---
 class ODataRequest(BaseModel):
     url: str
     username: str = ""
@@ -29,41 +60,31 @@ class QueryRequest(BaseModel):
     gemini_key: str
     gemini_url: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
 
-# --- Helper for Preview ---
 def get_preview_data(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
-    """Returns top N rows as a list of dicts, handling NaNs for JSON"""
     df_head = df.head(limit)
-    # Replace NaN with None (which becomes null in JSON)
     df_clean = df_head.where(pd.notnull(df_head), None)
     return df_clean.to_dict(orient="records")
 
-# --- Endpoints ---
+# --- Endpoints (Same as before) ---
 
 @app.post("/connect/odata")
 def connect_odata(req: ODataRequest, response: Response):
     try:
-        # Fetch
         df_raw = fetch_odata_cached(req.url, req.username, req.password, req.timeout)
-        
-        # Process
         key = f"odata::{req.url}"
         processed = build_processed_bundle_from_df(df_raw, key, use_duckdb=True)
-        
-        # Store Session
         session_id = create_session(processed)
         
-        # Cookie Automation
         response.set_cookie(key="session_id", value=session_id, httponly=True)
         
-        # Generate Preview
         preview_rows = get_preview_data(processed["df"], limit=10)
         columns = list(processed["df"].columns)
 
         return {
             "session_id": session_id,
             "rows": len(processed["df"]),
-            "columns": columns,          # <--- NEW: List of column names
-            "sample_data": preview_rows, # <--- NEW: First 10 rows
+            "columns": columns,
+            "sample_data": preview_rows,
             "message": "OData loaded successfully"
         }
     except Exception as e:
@@ -78,25 +99,20 @@ async def upload_file(response: Response, file: UploadFile = File(...)):
         else:
             df_raw = pd.read_excel(io.BytesIO(contents))
             
-        # Process
         key = f"upload::{file.filename}"
         processed = build_processed_bundle_from_df(df_raw, key, use_duckdb=True)
-        
-        # Store Session
         session_id = create_session(processed)
         
-        # Cookie Automation
         response.set_cookie(key="session_id", value=session_id, httponly=True)
         
-        # Generate Preview
         preview_rows = get_preview_data(processed["df"], limit=10)
         columns = list(processed["df"].columns)
         
         return {
             "session_id": session_id,
             "rows": len(processed["df"]),
-            "columns": columns,          # <--- NEW
-            "sample_data": preview_rows, # <--- NEW
+            "columns": columns,
+            "sample_data": preview_rows,
             "message": "File uploaded successfully"
         }
     except Exception as e:
@@ -108,30 +124,24 @@ def ask_question(
     response: Response, 
     session_id_cookie: Optional[str] = Cookie(None, alias="session_id")
 ):
-    # 1. RESOLVE SESSION ID
     final_session_id = req.session_id or session_id_cookie
     
     if not final_session_id:
         raise HTTPException(status_code=400, detail="Missing Session ID. Please upload a file first.")
 
-    # Retrieve Session
     session = get_session(final_session_id)
     if not session:
         response.delete_cookie("session_id")
-        raise HTTPException(status_code=404, detail="Session not found or expired.")
+        raise HTTPException(status_code=404, detail="Session not found or expired (Timeout 1 Hour).")
     
     df = session["df"]
     schema_json = session["schema_json"]
     aliases = session["aliases"]
     
-    # 2. Build Prompt
     prompt_preamble = build_prompt_cached(schema_json, aliases)
     full_prompt = prompt_preamble + "\nQuestion: " + req.question + "\nRespond ONLY with a JSON object containing keys: explain and expr."
     
-    # 3. Call Gemini
     resp = call_gemini_json(req.gemini_url, req.gemini_key, full_prompt)
-    
-    # 4. Extract Expression
     parsed = extract_json_from_response(resp)
     
     if not parsed or "expr" not in parsed:
@@ -147,7 +157,6 @@ def ask_question(
     expr = parsed["expr"]
     explanation = parsed.get("explain", "Executed successfully.")
     
-    # 5. Execute Code
     exec_result = safe_exec(expr, df)
     
     if exec_result["error"]:
@@ -160,7 +169,6 @@ def ask_question(
     
     result_obj = exec_result["result"]
     
-    # 6. Format Output
     result_table = []
     result_series = []
 
