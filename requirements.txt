@@ -8,3 +8,4 @@ matplotlib
 duckdb
 urllib3
 pydantic
+openpyxl
