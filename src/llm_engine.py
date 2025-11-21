@@ -1,16 +1,48 @@
 import requests
+import json
+import hashlib
 from functools import lru_cache
 
-def call_gemini_json(url, key, prompt, timeout=40):
+# 1. Create a Global Session (Reuses TCP connection for speed)
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+session.mount('https://', adapter)
+
+# 2. In-Memory Semantic Cache
+# Key: Hash(Schema + Question) -> Value: JSON Response from Gemini
+CODE_CACHE = {}
+
+def get_cache_key(schema_json, question):
+    """Creates a unique fingerprint for this specific question on this specific data."""
+    raw = f"{schema_json}::{question.strip().lower()}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+def call_gemini_json(url, key, prompt, timeout=40, schema_fingerprint=None):
+    """
+    Updated to use Persistent Session AND Caching.
+    """
+    # CHECK CACHE FIRST (Speed: 0.001s)
+    if schema_fingerprint and schema_fingerprint in CODE_CACHE:
+        print("⚡ CACHE HIT: Skipping Gemini, using saved code.")
+        return CODE_CACHE[schema_fingerprint]
+
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        return r.json()
+        # USE SESSION (Speed: Saves ~0.2s handshake)
+        r = session.post(url, headers=headers, json=payload, timeout=timeout)
+        resp_json = r.json()
+        
+        # SAVE TO CACHE if valid
+        if schema_fingerprint and "candidates" in resp_json:
+            CODE_CACHE[schema_fingerprint] = resp_json
+            
+        return resp_json
     except Exception as e:
         return {"error": str(e)}
 
-@lru_cache(maxsize=10)
+@lru_cache(maxsize=20)
 def build_prompt_cached(schema_json: str, aliases: str):
     PROMPT_PREAMBLE = f"""
 You are a data analysis agent. The dataframe is available as a pandas DataFrame named `df`.
@@ -106,5 +138,8 @@ B) User: "sdh total amount"
 - GOOD: "The total amount for Sub Detailed Head 012 is"
 - NEVER mention column names (like 'sub_detailed_head') in the explanation. Use human-readable names (e.g., "Sub Detailed Head").
 - Do NOT put the result number in the explanation (it will be calculated by the code).
+25. FORMATTING NUMBERS:
+- If the result is a float, round it to 2 decimal places in the explanation.
+- Avoid scientific notation (e.g., 3.6e-05) in the explanation text. Convert to regular decimal or percentage.
 """
     return PROMPT_PREAMBLE
