@@ -2,19 +2,19 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Request,
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
+import numpy as np  # <--- Added for float type checking
 import io
 import uvicorn
 import json
 import os
-import threading  
-import time       
+import threading
+import time
 from typing import Optional, List, Dict, Any
-
 
 # Import local modules
 from src.data_loader import fetch_odata_cached
 from src.data_processor import build_processed_bundle_from_df
-from src.data_manager import create_session, get_session, cleanup_sessions # <--- Added cleanup_sessions
+from src.data_manager import create_session, get_session, cleanup_sessions
 from src.llm_engine import call_gemini_json, build_prompt_cached, get_cache_key
 from src.execution import safe_exec
 from src.utils import extract_json_from_response
@@ -24,10 +24,10 @@ app = FastAPI(title="SAP OData ChatBot API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows ALL domains (Use specific domains in production)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- BACKGROUND TASK: CLEANUP LOOP ---
@@ -45,16 +45,16 @@ def run_cleanup_scheduler():
 
 @app.on_event("startup")
 async def startup_event():
-    # Start the background thread as a Daemon (dies when main app dies)
+    # Start the background thread as a Daemon
     t = threading.Thread(target=run_cleanup_scheduler, daemon=True)
     t.start()
     print("🕒 Session Cleanup Scheduler Started (TTL: 1 Hour)")
 
-# --- Pydantic Models & Helpers (Same as before) ---
+# --- Pydantic Models & Helpers ---
 class ODataRequest(BaseModel):
-    url: Optional[str] = None       # Optional
-    username: Optional[str] = None  # Optional
-    password: Optional[str] = None  # Optional
+    url: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
     timeout: int = 30
 
 class QueryRequest(BaseModel):
@@ -68,34 +68,27 @@ def get_preview_data(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
     df_clean = df_head.where(pd.notnull(df_head), None)
     return df_clean.to_dict(orient="records")
 
-# --- Endpoints (Same as before) ---
+# --- Endpoints ---
 
 @app.post("/connect/odata")
 def connect_odata(req: ODataRequest, response: Response):
     try:
-        # 2. Logic: User Input > Env Variable > Error
         final_url = req.url or os.getenv("SAP_ODATA_URL")
         final_user = req.username or os.getenv("SAP_USERNAME")
         final_pass = req.password or os.getenv("SAP_PASSWORD")
 
-        # Validation: If we still don't have credentials, stop.
         if not final_url or not final_user or not final_pass:
             raise ValueError("Missing OData Configuration. Please provide in request or set SAP_ODATA_URL/USER/PASS on server.")
 
-        # Fetch
         df_raw = fetch_odata_cached(final_url, final_user, final_pass, req.timeout)
         
-        # Process
         key = f"odata::{final_url}"
         processed = build_processed_bundle_from_df(df_raw, key, use_duckdb=True)
         
-        # Store Session
         session_id = create_session(processed)
         
-        # Cookie Automation
         response.set_cookie(key="session_id", value=session_id, httponly=True)
         
-        # Generate Preview
         preview_rows = get_preview_data(processed["df"], limit=10)
         columns = list(processed["df"].columns)
 
@@ -162,7 +155,6 @@ def ask_question(
     
     fingerprint = get_cache_key(schema_json, req.question)
     
-    # 3. Call Gemini (Pass the fingerprint!)
     resp = call_gemini_json(req.gemini_url, req.gemini_key, full_prompt, schema_fingerprint=fingerprint)
     parsed = extract_json_from_response(resp)
     
@@ -191,24 +183,46 @@ def ask_question(
     
     result_obj = exec_result["result"]
     
+    # --- CHANGED SECTION: INTELLIGENT FORMATTING ---
     result_table = []
     result_series = []
 
+    # 1. Check for "Fake" DataFrames (DuckDB single values)
+    is_scalar_df = False
     if isinstance(result_obj, pd.DataFrame):
-        df_clean = result_obj.where(pd.notnull(result_obj), None)
-        result_table = df_clean.head(1000000).to_dict(orient="records")
+        if result_obj.shape == (1, 1):
+            result_obj = result_obj.iloc[0, 0]
+            is_scalar_df = True
 
+    # 2. Handle actual DataFrames
+    if isinstance(result_obj, pd.DataFrame) and not is_scalar_df:
+        df_clean = result_obj.where(pd.notnull(result_obj), None)
+        # CHANGED: Limited to 1000 to prevent JSON timeout/crash on large queries
+        result_table = df_clean.head(1000).to_dict(orient="records")
+
+    # 3. Handle Series
     elif isinstance(result_obj, pd.Series):
         s_clean = result_obj.reset_index()
         s_clean = s_clean.where(pd.notnull(s_clean), None)
         result_series = s_clean.to_dict(orient="records")
         
+    # 4. Handle Scalars (Float formatting fix)
     else:
         if result_obj is not None:
+            val_str = str(result_obj)
+            
+            # Fix for Scientific Notation (e.g., 3.6e-05 -> 0.000036)
+            if isinstance(result_obj, (float, np.floating)):
+                if 0 < abs(result_obj) < 0.01:
+                    val_str = f"{result_obj:.8f}".rstrip("0").rstrip(".")
+                else:
+                    val_str = f"{result_obj:.2f}"
+            
+            # Append nicely to the explanation
             explanation = explanation.strip()
             if explanation.endswith("."):
                 explanation = explanation[:-1]
-            explanation = f"{explanation} {result_obj}"
+            explanation = f"{explanation} {val_str}"
         
     return {
         "answer": explanation,
@@ -217,5 +231,8 @@ def ask_question(
         "result_series": result_series
     }
 
+# --- CHANGED SECTION: PORT CONFIGURATION ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Gets the $PORT env variable (Cloud Run default), falls back to 8000
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
