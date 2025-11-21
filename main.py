@@ -5,17 +5,20 @@ import pandas as pd
 import io
 import uvicorn
 import json
+import os
 import threading  # <--- NEW
 import time       # <--- NEW
 from typing import Optional, List, Dict, Any
+
 
 # Import local modules
 from src.data_loader import fetch_odata_cached
 from src.data_processor import build_processed_bundle_from_df
 from src.data_manager import create_session, get_session, cleanup_sessions # <--- Added cleanup_sessions
-from src.llm_engine import call_gemini_json, build_prompt_cached
+from src.llm_engine import call_gemini_json, build_prompt_cached, get_cache_key
 from src.execution import safe_exec
 from src.utils import extract_json_from_response
+
 
 app = FastAPI(title="SAP OData ChatBot API")
 
@@ -49,9 +52,9 @@ async def startup_event():
 
 # --- Pydantic Models & Helpers (Same as before) ---
 class ODataRequest(BaseModel):
-    url: str
-    username: str = ""
-    password: str = ""
+    url: Optional[str] = None       # Optional
+    username: Optional[str] = None  # Optional
+    password: Optional[str] = None  # Optional
     timeout: int = 30
 
 class QueryRequest(BaseModel):
@@ -70,13 +73,29 @@ def get_preview_data(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
 @app.post("/connect/odata")
 def connect_odata(req: ODataRequest, response: Response):
     try:
-        df_raw = fetch_odata_cached(req.url, req.username, req.password, req.timeout)
-        key = f"odata::{req.url}"
+        # 2. Logic: User Input > Env Variable > Error
+        final_url = req.url or os.getenv("SAP_ODATA_URL")
+        final_user = req.username or os.getenv("SAP_USERNAME")
+        final_pass = req.password or os.getenv("SAP_PASSWORD")
+
+        # Validation: If we still don't have credentials, stop.
+        if not final_url or not final_user or not final_pass:
+            raise ValueError("Missing OData Configuration. Please provide in request or set SAP_ODATA_URL/USER/PASS on server.")
+
+        # Fetch
+        df_raw = fetch_odata_cached(final_url, final_user, final_pass, req.timeout)
+        
+        # Process
+        key = f"odata::{final_url}"
         processed = build_processed_bundle_from_df(df_raw, key, use_duckdb=True)
+        
+        # Store Session
         session_id = create_session(processed)
         
+        # Cookie Automation
         response.set_cookie(key="session_id", value=session_id, httponly=True)
         
+        # Generate Preview
         preview_rows = get_preview_data(processed["df"], limit=10)
         columns = list(processed["df"].columns)
 
@@ -85,7 +104,7 @@ def connect_odata(req: ODataRequest, response: Response):
             "rows": len(processed["df"]),
             "columns": columns,
             "sample_data": preview_rows,
-            "message": "OData loaded successfully"
+            "message": "OData loaded successfully (Used Server Credentials)"
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -141,7 +160,10 @@ def ask_question(
     prompt_preamble = build_prompt_cached(schema_json, aliases)
     full_prompt = prompt_preamble + "\nQuestion: " + req.question + "\nRespond ONLY with a JSON object containing keys: explain and expr."
     
-    resp = call_gemini_json(req.gemini_url, req.gemini_key, full_prompt)
+    fingerprint = get_cache_key(schema_json, req.question)
+    
+    # 3. Call Gemini (Pass the fingerprint!)
+    resp = call_gemini_json(req.gemini_url, req.gemini_key, full_prompt, schema_fingerprint=fingerprint)
     parsed = extract_json_from_response(resp)
     
     if not parsed or "expr" not in parsed:
@@ -174,7 +196,7 @@ def ask_question(
 
     if isinstance(result_obj, pd.DataFrame):
         df_clean = result_obj.where(pd.notnull(result_obj), None)
-        result_table = df_clean.head(1000).to_dict(orient="records")
+        result_table = df_clean.head(1000000).to_dict(orient="records")
 
     elif isinstance(result_obj, pd.Series):
         s_clean = result_obj.reset_index()
