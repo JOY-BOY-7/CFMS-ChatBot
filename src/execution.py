@@ -20,7 +20,6 @@ def safe_exec(expr, df):
     """
     
     # --- 1. CHECK FOR SQL MODE ---
-    # The prompt rule says SQL must start with "sql:"
     if isinstance(expr, str) and expr.strip().lower().startswith("sql:"):
         if not HAS_DUCKDB:
              return {
@@ -30,20 +29,11 @@ def safe_exec(expr, df):
              }
         
         try:
-            # Remove the "sql:" prefix to get the raw query
             sql_query = expr.strip()[4:].strip()
-            
-            # Setup DuckDB in-memory
             con = duckdb.connect(database=':memory:')
-            
-            # Register the pandas DataFrame as a table named 'odata'
-            # This allows the SQL "FROM odata" to work
             con.register('odata', df)
-            
-            # Execute
             result_df = con.execute(sql_query).df()
             con.close()
-            
             return {
                 "result": result_df, 
                 "error": None, 
@@ -72,21 +62,30 @@ def safe_exec(expr, df):
 
     with contextlib.redirect_stdout(f):
         try:
-            # Try eval first (for expressions)
+            # Try eval first (for expressions like "df.head()")
             try:
                 result = eval(expr, {}, local_env)
             except Exception:
-                # Fallback to exec (for statements)
+                # Fallback to exec (for statements like "x = ...")
                 exec(expr, {}, local_env)
                 result = None
-                # Find the last object created (heuristic for 'return value')
+                # Find the last object created
                 for k, v in reversed(list(local_env.items())):
                     if isinstance(v, (pd.DataFrame, pd.Series, plt.Figure)):
                         result = v
                         break
                 if result is None:
                     result = "Code executed successfully (no return value)"
+                    
+        except SyntaxError:
+            # --- 3. HANDLER FOR CONVERSATIONAL TEXT ---
+            # If the AI returns plain text (e.g., "Hello" or "only ask questions..."),
+            # Python raises a SyntaxError. We catch it and return the text as the result.
+            result = str(expr)
+            error = None
+            
         except Exception:
+            # For actual code errors (e.g., NameError, ValueError)
             error = traceback.format_exc()
             
     return {"result": result, "error": error, "stdout": f.getvalue()}
