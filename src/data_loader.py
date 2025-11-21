@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import urllib3
 from requests.adapters import HTTPAdapter
+from functools import lru_cache  # <--- 1. NEW IMPORT
 
 # Disable warnings globally for the module
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,6 +41,8 @@ def parse_odata_xml(xml_text):
         raise ValueError("No valid data entries found in OData response.")
     return pd.DataFrame(data)
 
+# 2. NEW DECORATOR: Caches the result of this function in RAM
+@lru_cache(maxsize=32)
 def fetch_odata_cached(odata_url: str, username: str = "", password: str = "", timeout: int = 30):
     """
     Fetch OData and return a DataFrame.
